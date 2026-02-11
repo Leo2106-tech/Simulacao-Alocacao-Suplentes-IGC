@@ -6,14 +6,16 @@ import unicodedata
 import pandas as pd
 import os
 import os.path
-import pickle
 from datetime import datetime
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+import io
+from googleapiclient.http import MediaIoBaseDownload
 
 warnings.filterwarnings("ignore")
 # ==============================================================================
@@ -165,6 +167,33 @@ def contar_detalhado_efetivos_e_desvios(df_mob, nomes_ignorar=set()):
                 
     return contagem_corretos, contagem_desvios, contagem_enviados
 
+def baixar_excel_completo(file_id):
+    """Baixa o arquivo .xlsx uma única vez e retorna todas as abas."""
+    creds = get_bot_creds()
+    drive_service = build('drive', 'v3', credentials=creds)
+    
+    try:
+        print(f"   -> Baixando arquivo Excel (ID: {file_id})...")
+        request = drive_service.files().get_media(fileId=file_id)
+        file_stream = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_stream, request)
+        
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        
+        file_stream.seek(0)
+        
+        # Carrega todas as abas de uma vez (sheet_name=None retorna um dicionário)
+        dict_dfs = pd.read_excel(file_stream, sheet_name=None, engine='openpyxl')
+        
+        # Limpa os nomes das abas e das colunas para evitar erros de digitação
+        return {str(k).strip(): df for k, df in dict_dfs.items()}
+
+    except Exception as e:
+        print(f" [ERRO] Falha ao baixar/abrir o arquivo Excel: {e}")
+        return None
+
 
 # ==============================================================================
 # 3) FUNÇÕES GOOGLE (SHEETS E DRIVE)
@@ -187,10 +216,16 @@ def get_google_sheet_data(sheet_name, spreadsheet_id=None):
             valores = result['values']
             if valores:
                 cabecalho = valores[0]
-                df = pd.DataFrame(valores[1:], columns=cabecalho)
-                # Ajuste de colunas extras se necessário
-                if len(df.columns) != len(cabecalho):
-                    df = pd.DataFrame(valores[1:])
+                dados = valores[1:]
+                
+                # Normaliza o tamanho das linhas para evitar erro de colunas desiguais
+                num_cols = len(cabecalho)
+                dados_normalizados = []
+                for linha in dados:
+                    linha_ajustada = linha + [""] * (num_cols - len(linha)) if len(linha) < num_cols else linha[:num_cols]
+                    dados_normalizados.append(linha_ajustada)
+                
+                df = pd.DataFrame(dados_normalizados, columns=cabecalho)
                 return df
             else:
                 return pd.DataFrame()
@@ -222,9 +257,11 @@ def get_bot_creds():
 def get_user_creds():
     """ Usa o client_secret.json (OAuth) para logar como USUÁRIO """
     creds = None
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
+    if os.path.exists('token.json'):
+        try:
+            creds = UserCredentials.from_authorized_user_file('token.json', ["https://www.googleapis.com/auth/drive"])
+        except Exception:
+            creds = None
             
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -240,8 +277,8 @@ def get_user_creds():
             )
             creds = flow.run_local_server(port=0)
             
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
             
     return creds
 
@@ -265,7 +302,7 @@ def salvar_log_na_planilha(status, link_drive):
         
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{NOME_DA_ABA}'!A5", 
+            range=f"'{NOME_DA_ABA}'!A2", 
             valueInputOption="USER_ENTERED",
             body=body
         ).execute()
@@ -680,11 +717,29 @@ def rodar_distribuicao(
 
     print("  ⏳ Otimizando...")
     try:
-        solver = pl.HiGHS(msg=True,timeLimit=300)
+        # 1ª Condição: Tenta o HiGHS padrão (espera que o binário esteja no PATH)
+        print("    -> Tentando HiGHS (Interface padrão)...")
+        solver = pl.HiGHS(msg=True, timeLimit=300)
         prob.solve(solver)
     except:
-        solver = pl.PULP_CBC_CMD(msg=True, timeLimit=300)
-        prob.solve(solver)
+        try:
+            # 2ª Condição: Tenta o HiGHS via binário do pacote highspy (recomendado para o Render)
+            print("    -> Tentando HiGHS (via caminho do highspy)...")
+            import highspy
+            import os
+            
+            # Localiza o binário dentro do pacote instalado pelo pip
+            path_bin = os.path.join(os.path.dirname(highspy.__file__), "highs")
+            if not os.path.exists(path_bin):
+                path_bin = os.path.join(os.path.dirname(highspy.__file__), "bin", "highs")
+            
+            solver = pl.HiGHS_CMD(path=path_bin, msg=True, timeLimit=300)
+            prob.solve(solver)
+        except Exception as e:
+            # 3ª Condição: Fallback final para o CBC (Solver padrão do PuLP)
+            print(f"    -> Falha nos solvers HiGHS. Iniciando CBC... Erro: {e}")
+            solver = pl.PULP_CBC_CMD(msg=True, timeLimit=300)
+            prob.solve(solver)
 
     # ---------- RESULTADOS ----------
     lista_pessoas = []
@@ -753,28 +808,27 @@ def rodar_distribuicao(
 def processar_simulacao(id_planilha_input, id_linha_appsheet):
     print(f"--- Iniciando Simulação para a planilha ID: {id_planilha_input} ---")
     
-    # 1. Configuração Dinâmica, usa o ID que veio do AppSheet
-    global SPREADSHEET_ID 
-    SPREADSHEET_ID = id_planilha_input
+    # 1. Baixa o arquivo .xlsx inteiro (apenas uma chamada ao Drive)
+    dados_excel = baixar_excel_completo(id_planilha_input)
+    
+    if not dados_excel:
+        return "Erro", "Não foi possível baixar o arquivo .xlsx do Drive."
 
     try:
-        # Acesse os dados do Google Sheets
-        df_pes = get_google_sheet_data(ABA_PESSOAS)
-        df_proj = get_google_sheet_data(ABA_PROJETOS)
-        df_mob = get_google_sheet_data(ABA_MOBILIZADOS)
-        df_req = get_google_sheet_data(ABA_REQUISITOS)
-        df_docs = get_google_sheet_data(ABA_DOCS_PESSOAS)
-        df_local = get_google_sheet_data(ABA_LOCAL)
-        df_afastamento = get_google_sheet_data(ABA_AFASTAMENTO)
+        # 2. Extrai os DataFrames do dicionário. Se a aba não existir, retorna DF vazio.
+        df_pes = dados_excel.get(ABA_PESSOAS, pd.DataFrame())
+        df_proj = dados_excel.get(ABA_PROJETOS, pd.DataFrame())
+        df_mob = dados_excel.get(ABA_MOBILIZADOS, pd.DataFrame())
+        df_req = dados_excel.get(ABA_REQUISITOS, pd.DataFrame())
+        df_docs = dados_excel.get(ABA_DOCS_PESSOAS, pd.DataFrame())
+        df_local = dados_excel.get(ABA_LOCAL, pd.DataFrame())
+        df_afastamento = dados_excel.get(ABA_AFASTAMENTO, pd.DataFrame())
         
     except Exception as e:
-        print(f"Erro ao ler Google Sheets: {e}")
-        return
+        return "Erro", f"Erro ao processar abas do Excel: {str(e)}"
 
-    # Verifique se os DataFrames estão vazios corretamente com .empty
     if df_pes.empty or df_proj.empty:
-        print("Dados de Pessoas ou Projetos não encontrados.")
-        return
+        return "Erro", "Abas 'Pessoas' ou 'Projetos' não encontradas ou vazias no Excel."
 
     df_pes = df_pes.copy()
     
@@ -1033,50 +1087,50 @@ def processar_simulacao(id_planilha_input, id_linha_appsheet):
         except PermissionError:
             print(f"\n[ERRO] Não foi possível salvar '{out}'. Feche o arquivo se ele estiver aberto.")
 
-def main_loop():
-    print(" Robô Iniciado. Aguardando pedidos do AppSheet...")
+def main():
+    print("--- Verificando pedidos pendentes no AppSheet ---")
     
-    while True:
-        try:
-            # Lê a planilha do AppSheet para ver se tem alguém com Status "Pendente"
-            df_fila = get_google_sheet_data("Otimizar Alocação de Suplentes", spreadsheet_id=APPSHEET_DB_ID)
+    try:
+        # Lê a planilha do AppSheet para ver se tem alguém com Status "Pendente"
+        df_fila = get_google_sheet_data("Otimizar Alocação de Suplentes", spreadsheet_id=APPSHEET_DB_ID)
+        
+        if not df_fila.empty and "Status_Simulacao" in df_fila.columns:
+            pendentes = df_fila[df_fila["Status_Simulacao"] == "Pendente"]
             
-            if not df_fila.empty and "Status_Simulacao" in df_fila.columns:
-                pendentes = df_fila[df_fila["Status_Simulacao"] == "Pendente"]
+            if pendentes.empty:
+                print("Nenhum pedido pendente encontrado.")
+                return
                 
-                for index, row in pendentes.iterrows():
-                    print(f"\n>>> Novo pedido na linha {index+2}")
-                    
-                    # Extrai o ID do arquivo que o usuário editou
-                    link_dados = str(row.get("Dados", ""))
-                    if "id=" in link_dados: file_id = link_dados.split("id=")[1].split("&")[0]
-                    elif "/d/" in link_dados: file_id = link_dados.split("/d/")[1].split("/")[0]
-                    else: file_id = ""
+            for index, row in pendentes.iterrows():
+                print(f"\n>>> Novo pedido na linha {index+2}")
+                
+                # Extrai o ID do arquivo que o usuário editou
+                link_dados = str(row.get("Dados", ""))
+                file_id = ""
+                if "/d/" in link_dados: file_id = link_dados.split("/d/")[1].split("/")[0]
+                elif "id=" in link_dados: file_id = link_dados.split("id=")[1].split("&")[0]
+                else: file_id = link_dados.strip() # Tenta usar o texto direto caso o usuário tenha colado só o ID
 
-                    if not file_id:
-                        atualizar_linha_appsheet(index, "Erro", log_erro="Arquivo inválido")
-                        continue
+                if not file_id:
+                    atualizar_linha_appsheet(index, "Erro", log_erro="Arquivo inválido")
+                    continue
 
-                    # Avisa que começou
-                    atualizar_linha_appsheet(index, "Processando")
-                    
-                    # CHAMA A SUA OTIMIZAÇÃO
-                    status_final, resultado = processar_simulacao(file_id, str(row.get("ID", index)))
-                    
-                    # Salva o resultado final
-                    if status_final == "Concluido":
-                        atualizar_linha_appsheet(index, "Concluido", link_relatorio=resultado)
-                    else:
-                        atualizar_linha_appsheet(index, "Erro", log_erro=resultado)
+                # Avisa que começou
+                atualizar_linha_appsheet(index, "Processando")
+                
+                # CHAMA A SUA OTIMIZAÇÃO
+                status_final, resultado = processar_simulacao(file_id, str(row.get("ID", index)))
+                
+                # Salva o resultado final
+                if status_final == "Concluido":
+                    atualizar_linha_appsheet(index, "Concluido", link_relatorio=resultado)
+                else:
+                    atualizar_linha_appsheet(index, "Erro", log_erro=resultado)
+        else:
+            print("Planilha vazia ou coluna 'Status_Simulacao' não encontrada.")
             
-            # Espera 10 segundos antes de olhar de novo
-            import time
-            time.sleep(10)
-            
-        except Exception as e:
-            print(f"Erro no loop: {e}")
-            import time
-            time.sleep(10)
+    except Exception as e:
+        print(f"Erro na execução: {e}")
 
 if __name__ == "__main__":
-    main_loop()
+    main()

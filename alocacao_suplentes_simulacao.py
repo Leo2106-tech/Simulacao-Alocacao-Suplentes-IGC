@@ -6,12 +6,12 @@ import unicodedata
 import pandas as pd
 import os
 import os.path
+import pickle
 from datetime import datetime
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
-from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -222,11 +222,9 @@ def get_bot_creds():
 def get_user_creds():
     """ Usa o client_secret.json (OAuth) para logar como USUÁRIO """
     creds = None
-    if os.path.exists('token.json'):
-        try:
-            creds = UserCredentials.from_authorized_user_file('token.json', ["https://www.googleapis.com/auth/drive"])
-        except Exception:
-            creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
             
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -242,8 +240,8 @@ def get_user_creds():
             )
             creds = flow.run_local_server(port=0)
             
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
             
     return creds
 
@@ -267,7 +265,7 @@ def salvar_log_na_planilha(status, link_drive):
         
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{NOME_DA_ABA}'!A2", 
+            range=f"'{NOME_DA_ABA}'!A5", 
             valueInputOption="USER_ENTERED",
             body=body
         ).execute()
@@ -682,29 +680,11 @@ def rodar_distribuicao(
 
     print("  ⏳ Otimizando...")
     try:
-        # 1ª Condição: Tenta o HiGHS padrão (espera que o binário esteja no PATH)
-        print("    -> Tentando HiGHS (Interface padrão)...")
-        solver = pl.HiGHS(msg=True, timeLimit=300)
+        solver = pl.HiGHS(msg=True,timeLimit=300)
         prob.solve(solver)
     except:
-        try:
-            # 2ª Condição: Tenta o HiGHS via binário do pacote highspy (recomendado para o Render)
-            print("    -> Tentando HiGHS (via caminho do highspy)...")
-            import highspy
-            import os
-            
-            # Localiza o binário dentro do pacote instalado pelo pip
-            path_bin = os.path.join(os.path.dirname(highspy.__file__), "highs")
-            if not os.path.exists(path_bin):
-                path_bin = os.path.join(os.path.dirname(highspy.__file__), "bin", "highs")
-            
-            solver = pl.HiGHS_CMD(path=path_bin, msg=True, timeLimit=300)
-            prob.solve(solver)
-        except Exception as e:
-            # 3ª Condição: Fallback final para o CBC (Solver padrão do PuLP)
-            print(f"    -> Falha nos solvers HiGHS. Iniciando CBC... Erro: {e}")
-            solver = pl.PULP_CBC_CMD(msg=True, timeLimit=300)
-            prob.solve(solver)
+        solver = pl.PULP_CBC_CMD(msg=True, timeLimit=300)
+        prob.solve(solver)
 
     # ---------- RESULTADOS ----------
     lista_pessoas = []
